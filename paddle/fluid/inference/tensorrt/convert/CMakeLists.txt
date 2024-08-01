@@ -60,6 +60,7 @@ list(
   nearest_interp_op.cc
   reshape_op.cc
   reduce_op.cc
+  where_index_op.cc
   gather_nd_op.cc
   tile_op.cc
   conv3d_op.cc

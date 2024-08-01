@@ -2460,6 +2460,14 @@ struct SimpleOpTypeSetTeller : public Teller {
       }
     }
 
+    if (op_type == "where_index") {
+      if (!with_dynamic_shape) {
+        VLOG(3) << "the where_index does not support "
+                   "static shape yet";
+        return false;
+      }
+    }
+
     if (op_type == "cast") {
 // trt 6015 result in Windows ppyolo_mbv3 TRT fp32 diff
 #if !IS_TRT_VERSION_GE(7000)
@@ -3048,6 +3056,7 @@ struct SimpleOpTypeSetTeller : public Teller {
       "c_allreduce_prod",
       "roll",
       "cast",
+      "where_index",
       "preln_skip_layernorm",
       "transformer_input_convert",
       "recover_padding",
@@ -3221,6 +3230,7 @@ struct SimpleOpTypeSetTeller : public Teller {
       "c_allreduce_prod",
       "roll",
       "cast",
+      "where_index",
       "transformer_input_convert",
       "recover_padding",
       "remove_padding",
