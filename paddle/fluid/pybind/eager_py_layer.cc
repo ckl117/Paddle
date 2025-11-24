@@ -39,11 +39,11 @@ limitations under the License. */
 #pragma GCC diagnostic ignored "-Wwrite-strings"
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 COMMON_DECLARE_bool(check_cuda_error);
-
-using egr::ConvertToDistTensor;
-
+COMMON_DECLARE_bool(check_nan_inf);
+COMMON_DECLARE_int32(call_stack_level);
 COMMON_DECLARE_int64(offload_retry_times);
 
+using egr::ConvertToDistTensor;
 namespace paddle::pybind {
 
 PyTypeObject* p_pylayer_type;
@@ -192,7 +192,17 @@ PyObject* pylayer_method_apply(PyObject* cls,
                                PyObject* kwargs) {
   EAGER_TRY
   SetPythonStack();
-  VLOG(6) << "Begin run PyLayer apply...";
+  std::string classname =
+      std::string(reinterpret_cast<PyTypeObject*>(cls)->tp_name);
+  std::string forward_stack;
+  if (VLOG_IS_ON(2)) egr::LogIndent::Instance().IncreaseIndentLevel();
+  if (FLAGS_check_nan_inf || FLAGS_call_stack_level == 3) {
+    // record the forward stack
+    forward_stack = egr::Controller::Instance().GetPythonStack();
+  }
+  VLOG(3) << classname << ":Running PyLayer Apply ";
+  VLOG(4) << classname << ":"
+          << "Construct PyLayerContext";
   PyObject* backward_function =
       PyObject_GetAttrString(cls, "_backward_function");
   if (!backward_function) {
@@ -230,7 +240,8 @@ PyObject* pylayer_method_apply(PyObject* cls,
   forward_args = PyTuple_New(args_size + 1);  // NOLINT
   Py_INCREF(ctx);
   PyTuple_SET_ITEM(forward_args, 0, reinterpret_cast<PyObject*>(ctx));
-
+  VLOG(6) << classname << ":Prepare Pylayer forward args ";
+  VLOG(6) << classname << ":Input size is " << inputs_size;
   std::vector<std::vector<egr::AutogradMeta*>> inputs_autograd_meta;
   inputs_autograd_meta.reserve(inputs_size);
   std::vector<std::vector<paddle::Tensor*>> inputs_tensor;
@@ -373,7 +384,12 @@ PyObject* pylayer_method_apply(PyObject* cls,
     }
   }
 
+  // Check LeafTensor if its GradNodeAccumulation TensorMeta is consistent with
+  // its TensorMeta
+  egr::CheckGradNodeAccumulation(inputs_tensor);
+
   VLOG(6)
+      << classname << ":"
       << "PyLayer forward args is ready, begin call user's forward function...";
   // call forward
   auto forward_fn = PyObject_GetAttrString(cls, "forward");
@@ -500,9 +516,11 @@ PyObject* pylayer_method_apply(PyObject* cls,
 
   if (outputs_tensor.empty()) {
     PADDLE_THROW(common::errors::InvalidArgument(
-        "At least one output of `PyLayer.forward` is a `Tensor`."));
+        "%s : At least one output of `PyLayer.forward` is a `Tensor`.",
+        classname));
   }
-  VLOG(6) << "PyLayer forward function finish...";
+  VLOG(6) << classname << ":"
+          << "PyLayer forward function finish...";
 
 #ifdef PADDLE_WITH_CUDA
   bool has_grad = false;
@@ -527,8 +545,9 @@ PyObject* pylayer_method_apply(PyObject* cls,
                             egr::EagerUtils::IsLeafTensor(*inplace_tensor),
                         false,
                         common::errors::InvalidArgument(
-                            "Leaf Var (%s) that doesn't stop gradient "
+                            "%s : Leaf Var (%s) that doesn't stop gradient "
                             "can't use inplace strategy.",
+                            classname,
                             inplace_tensor->name()));
       inplace_tensor->bump_inplace_version();
       VLOG(3) << "Tensor(" << inplace_tensor->name()
@@ -539,8 +558,13 @@ PyObject* pylayer_method_apply(PyObject* cls,
         std::make_shared<egr::GradNodePyLayer>(reinterpret_cast<PyObject*>(ctx),
                                                outputs_autograd_meta.size(),
                                                inputs_autograd_meta.size());
-    VLOG(3) << "Create grad node " << grad_node->name() << " addr "
+    VLOG(3) << classname << ":"
+            << "Create grad node " << grad_node->name() << " addr "
             << grad_node;
+    // For dump call stack
+    if (FLAGS_check_nan_inf || FLAGS_call_stack_level == 3) {
+      grad_node->SetForwardTrace(forward_stack);
+    }
 
 #ifdef PADDLE_WITH_CUDA
     has_grad = true;
@@ -575,7 +599,8 @@ PyObject* pylayer_method_apply(PyObject* cls,
         grad_node->SetGradInMeta(*outputs_tensor[i][0], i);
       }
     }
-    VLOG(6) << "PyLayer construct backward node finish...";
+    VLOG(6) << classname << ":"
+            << "PyLayer construct backward node finish...";
   }
 
   if (outputs_size == 1) {
@@ -586,6 +611,8 @@ PyObject* pylayer_method_apply(PyObject* cls,
       Py_XDECREF(outputs_tuple);
     }
   }
+  VLOG(3) << classname << ":"
+          << "PyLayer output size " << outputs_size;
 
   if (PyList_Check(outputs)) {
     Py_XDECREF(outputs_tuple);
@@ -599,8 +626,9 @@ PyObject* pylayer_method_apply(PyObject* cls,
 #ifdef PADDLE_WITH_CUDA
   if (has_grad && FLAGS_offload_retry_times > 0) {
     auto grad_node = ctx->grad_node.lock();
-    PADDLE_ENFORCE_NOT_NULL(grad_node,
-                            phi::errors::InvalidArgument("Cannot be null"));
+    PADDLE_ENFORCE_NOT_NULL(
+        grad_node,
+        phi::errors::InvalidArgument("%s : Cannot be null", classname));
     PyLayerAddOffloadActivation(ctx, grad_node->name());
   }
 #endif
@@ -610,7 +638,9 @@ PyObject* pylayer_method_apply(PyObject* cls,
     egr::CUDAErrorCheck("pylayer_method_apply " +
                         std::string(Py_TYPE(ctx)->tp_name) + " finish");
   }
-
+  VLOG(3) << classname << ":"
+          << "Finish PyLayer Apply";
+  if (VLOG_IS_ON(2)) egr::LogIndent::Instance().DecreaseIndentLevel();
   return outputs;
   EAGER_CATCH_AND_THROW_RETURN_NULL
 }
@@ -881,9 +911,7 @@ void BindEagerPyLayer(PyObject* module) {
   type->tp_base = reinterpret_cast<PyTypeObject*>(&PyBaseObject_Type);
   type->tp_flags |=
       Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HEAPTYPE;  // NOLINT
-#if PY_VERSION_HEX >= 0x03050000
   type->tp_as_async = &heap_type->as_async;
-#endif
   p_pylayer_type = type;
 
   if (PyType_Ready(type) < 0) {

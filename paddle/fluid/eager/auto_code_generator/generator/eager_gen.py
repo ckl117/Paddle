@@ -106,6 +106,7 @@ type_promote_white_list = {
     "elementwise_pow": ["x", "y"],
     "where": ["x", "y"],
     "equal": ["x", "y"],
+    "equal_all": ["x", "y"],
     "not_equal": ["x", "y"],
     "less_than": ["x", "y"],
     "less_equal": ["x", "y"],
@@ -310,9 +311,6 @@ strided_compute_op_list = {
     "index_put",
     # others
     "matmul",
-    "split",
-    "split_with_num",
-    "expand",
 }
 
 strided_op_need_flags_check_list = {
@@ -386,16 +384,22 @@ SET_ATTR_METHOD_TEMPLATE = """  void SetAttribute_{}({} {}) {{
     {} = {};
   }}
 """
-
+SAVE_TENSOR_MD5_CHECKSUM_TEMPLATE = """
+  // Save the tensors checksum to file_path
+  if(!FLAGS_tensor_md5_checksum_output_path.empty()){{
+{}
+  }}
+"""
 ATTRIBUTE_MEMBER_WITH_DEFAULT_TEMPLATE = """  {} {} = {};
 """
 
 ATTRIBUTE_MEMBER_TEMPLATE = """  {} {};
 """
 SET_TENSOR_NAME_TEMPLATE = """
-  if(VLOG_IS_ON(6)){{
+  if(VLOG_IS_ON(6)||FLAGS_enable_unique_name)
+{{
 {}
-  }}
+}}
 """
 
 NODE_DECLARATION_TEMPLATE = """
@@ -439,7 +443,7 @@ GRAD_FUNCTION_TEMPLATE = """
 paddle::small_vector<std::vector<paddle::Tensor>, egr::kSlotSmallVectorSize> {}::operator()(paddle::small_vector<std::vector<paddle::Tensor>, egr::kSlotSmallVectorSize>& grads, bool create_graph, bool is_new_grad) {{
   VLOG(3) << \"\\n\"<<separator<< \"Running_AD_API_GRAD: \" << \"{}\"<<separator;
   if (FLAGS_check_cuda_error) [[unlikely]] {{
-    egr::CUDAErrorCheck(\"{} begin\");
+    egr::CUDAErrorCheck(\"{} (\"+egr::GetGradNodeHexAddress(this)+\") begin\");
   }}
 
    // This 'Local_XXXGradNode' record event is different with 'Global_XXXGradNode' event.
@@ -473,7 +477,7 @@ paddle::small_vector<std::vector<paddle::Tensor>, egr::kSlotSmallVectorSize> {}:
   // Generate a unique API name
 
   std::string unique_api_name;
-  if (VLOG_IS_ON(3)) {{
+  if (VLOG_IS_ON(3)||FLAGS_enable_unique_name) {{
     static int64_t call_count = 0;
     call_count ++;
     unique_api_name = egr::GenerateUniqueApiName(\"{}\", call_count);
@@ -497,7 +501,7 @@ paddle::small_vector<std::vector<paddle::Tensor>, egr::kSlotSmallVectorSize> {}:
   }}
 
   if (FLAGS_check_cuda_error) [[unlikely]] {{
-    egr::CUDAErrorCheck(\"{} finish\");
+    egr::CUDAErrorCheck(\"{} (\"+egr::GetGradNodeHexAddress(this)+\") finish\");
   }}
     VLOG(4) << \"\\n\"<<separator<<\"Finish_AD_API_GRAD: {}\"<<separator;
 
@@ -530,6 +534,9 @@ TEST_API {} {}({}) {{
   // Get Input AutoGradMeta
 {}
 
+  // Check LeafTensor if its GradNodeAccumulation TensorMeta is consistent with its TensorMeta
+{}
+
  // Before log info
 {}
 
@@ -547,11 +554,16 @@ TEST_API {} {}({}) {{
   // Generate a unique API name
 
   std::string unique_api_name;
-  if (VLOG_IS_ON(3)) {{
+  if (VLOG_IS_ON(3)||FLAGS_enable_unique_name) {{
     static int64_t call_count = 0;
     call_count ++;
     unique_api_name = egr::GenerateUniqueApiName(\"{}\", call_count);
   }}
+  // Save forward call stack to file for debug
+  if( FLAGS_call_stack_level == 3 && !FLAGS_dump_api_python_stack_path.empty()){{
+    egr::SavePythonCallStackToFile(FLAGS_dump_api_python_stack_path, unique_api_name);
+  }}
+
   VLOG(3) << \"\\n\"<<separator<<\"Running_C++_API: \" << unique_api_name << separator;
   // Forward API Call
 {}
@@ -585,6 +597,14 @@ AFTER_LOG_PRINT_TEMPLATE = """
     const char* INPUT_PRINT_TEMPLATE = \"{{ Input: [%s]  \\n Output: [%s] }} \";
 {}
     VLOG(6) << paddle::string::Sprintf(INPUT_PRINT_TEMPLATE, input_str, output_str);
+  }}
+"""
+
+FORWARD_AFTER_LOG_PRINT_TEMPLATE = """
+  if (VLOG_IS_ON(3)) {{
+    const char* INPUT_PRINT_TEMPLATE = \"\\nForward Debug Info {{\\nAPI_Name: %s \\nInput: [%s]  \\nOutput: [%s] }} \";
+{}
+    VLOG(3) << paddle::string::Sprintf(INPUT_PRINT_TEMPLATE, unique_api_name, input_str, output_str);
   }}
 """
 
@@ -625,12 +645,15 @@ TEST_API {} {}({}) {{
 {}
   // Generate a unique API name
   std::string unique_api_name;
-  if(VLOG_IS_ON(3)){{
+  if(VLOG_IS_ON(3)||FLAGS_enable_unique_name){{
     static int64_t call_count = 0;
     call_count ++;
     unique_api_name = egr::GenerateUniqueApiName(\"{}\", call_count);
   }}
-
+  // Save forward call stack to file for debug
+  if( FLAGS_call_stack_level == 3 && !FLAGS_dump_api_python_stack_path.empty()){{
+    egr::SavePythonCallStackToFile(FLAGS_dump_api_python_stack_path, unique_api_name);
+  }}
   VLOG(3) << \"\\n\"<<separator<<\"Running_C++_API: \" << unique_api_name <<separator;
   // Forward API Call
 {}
@@ -665,6 +688,11 @@ FORWARD_BODY_BEFORE_API_CALL_TEMPLATE = """  if (require_any_grad) {{
   if (FLAGS_check_nan_inf || FLAGS_call_stack_level == 3) {{
     grad_node->SetForwardTrace(egr::Controller::Instance().GetPythonStack());
   }}
+   // Set for Record Subgraph
+   if(egr::EagerBackwardSubGraphNodeRecorder::Instance().NeedCaptureSubGraph()){{
+       VLOG(3)<<"Capture the grad node"<<grad_node->name()<<"("<<grad_node.get()<<")"<<"for subgraph.";
+       egr::EagerBackwardSubGraphNodeRecorder::Instance().AddGradNode(grad_node.get());
+   }}
     // SetAttributes if needed
 {}
     // Set TensorWrappers for Forward Inputs if needed
@@ -673,7 +701,7 @@ FORWARD_BODY_BEFORE_API_CALL_TEMPLATE = """  if (require_any_grad) {{
 """
 
 FORWARD_BODY_AFTER_API_CALL_TEMPLATE = """  if (require_any_grad) {{
-    if(VLOG_IS_ON(6)){{
+    if(VLOG_IS_ON(6)||FLAGS_enable_unique_name){{
         // Set GradNodeName
         grad_node->SetNameFromAPI(unique_api_name);
     }}
@@ -695,7 +723,7 @@ HIGHER_ORDER_DERIVATIVE_VALUE_TEMPLATE = """  if (trace_backward) {{
 {}
     // Node Construction
 {}
-    if(VLOG_IS_ON(6)){{
+    if(VLOG_IS_ON(6)||FLAGS_enable_unique_name){{
         //Set GradNode Name
         grad_node->SetNameFromAPI(unique_api_name);
     }}
@@ -745,6 +773,8 @@ NODE_CC_FILE_TEMPLATE = """
 #include "paddle/phi/api/lib/data_transform.h"
 COMMON_DECLARE_bool(check_nan_inf);
 COMMON_DECLARE_bool(check_cuda_error);
+COMMON_DECLARE_bool(enable_unique_name);
+COMMON_DECLARE_string(tensor_md5_checksum_output_path);
 static std::string separator = "==========================";
 {}
 """
@@ -792,6 +822,9 @@ COMMON_DECLARE_string(tensor_operants_mode);
 COMMON_DECLARE_bool(use_stride_kernel);
 COMMON_DECLARE_bool(use_stride_compute_kernel);
 COMMON_DECLARE_bool(check_cuda_error);
+COMMON_DECLARE_bool(enable_unique_name);
+COMMON_DECLARE_string(tensor_md5_checksum_output_path);
+COMMON_DECLARE_string(dump_api_python_stack_path);
 static std::string separator = "==========================";
 {}
 {}
@@ -1883,6 +1916,7 @@ class DygraphForwardFunctionGenerator(DygraphFunctionGeneratorBase):
         else:
             forward_inplace_map = {}
         indent = GetIndent(1)
+        check_input_grad_node_str = ""
 
         # Get Function Args
         num_inputs = len(forward_attrs_list) + len(forward_inputs_position_map)
@@ -2135,6 +2169,7 @@ class DygraphForwardFunctionGenerator(DygraphFunctionGeneratorBase):
 
         # Get Outputs
         get_outputs_str = ""
+        save_md5_checksum_str = ""
         set_tensor_name_str = ""
         for name, (rtype, pos) in forward_outputs_position_map.items():
             if num_outputs == 1 and len(intermediate_outputs) == 0:
@@ -2144,7 +2179,12 @@ class DygraphForwardFunctionGenerator(DygraphFunctionGeneratorBase):
                     f"{indent}auto& {name} = std::get<{pos}>(api_result);\n"
                 )
             set_tensor_name_str += f'{indent}{indent}egr::SetTensorName(unique_api_name, "{name}", &{name});\n'
+            save_md5_checksum_str += f"{indent}{indent}egr::SaveTensorMD5CheckSumToFile(FLAGS_tensor_md5_checksum_output_path, {name});\n"
+
         get_outputs_str += SET_TENSOR_NAME_TEMPLATE.format(set_tensor_name_str)
+        get_outputs_str += SAVE_TENSOR_MD5_CHECKSUM_TEMPLATE.format(
+            save_md5_checksum_str
+        )
         # Get return type list & outputs
         returns_type_list = ["" for i in range(num_outputs)]
         returns_list = ["" for i in range(num_outputs)]
@@ -2291,6 +2331,17 @@ class DygraphForwardFunctionGenerator(DygraphFunctionGeneratorBase):
 
                 outputs_autograd_meta_list.append(output_autograd_meta)
             outputs_autograd_meta_str = "\n".join(outputs_autograd_meta_list)
+
+            # 3. Check Input Accumulation Node
+            check_input_grad_node_str_list = []
+            for name, (_, _) in forward_inputs_position_map.items():
+                check_input_grad_node_str_list.append(
+                    f"{indent}egr::CheckGradNodeAccumulation({name});"
+                )
+            if check_input_grad_node_str_list:
+                check_input_grad_node_str = "\n".join(
+                    check_input_grad_node_str_list
+                )
 
             # Node Creation
             self.GenerateNodeCreationCodes(is_inplaced=is_inplaced)
@@ -2486,7 +2537,7 @@ class DygraphForwardFunctionGenerator(DygraphFunctionGeneratorBase):
             var_str += f"\n{indent}  std::string output_{name}_str = paddle::string::Sprintf(TENSOR_{name.upper()}_TEMPLATE, egr::EagerUtils::TensorStr({name}));"
             var_str += f"\n{indent}  output_str += output_{name}_str;"
 
-        log_str = AFTER_LOG_PRINT_TEMPLATE.format(var_str)
+        log_str = FORWARD_AFTER_LOG_PRINT_TEMPLATE.format(var_str)
 
         strided_flags_check = ""
         if is_inplaced and (
@@ -2559,6 +2610,7 @@ class DygraphForwardFunctionGenerator(DygraphFunctionGeneratorBase):
                 type_autocast_logic_str,
                 layout_logic_str,
                 inputs_autograd_meta_str,
+                check_input_grad_node_str,
                 before_log_str,
                 compute_require_grad_args_str,
                 self.grad_node_name,
@@ -3358,6 +3410,7 @@ if (paddle::prim::PrimCommonUtils::IsEagerPrimEnabled() && !need_skip) {{
 
         num_fwd_outputs = len(backward_grad_outputs_map)
         set_tensor_name_str = ""
+        save_md5_checksum_str = ""
         for name, (
             rtype,
             pos,
@@ -3398,11 +3451,15 @@ if (paddle::prim::PrimCommonUtils::IsEagerPrimEnabled() && !need_skip) {{
     }}
 """
             set_tensor_name_str += f"""    egr::SetGradTensorName(&{transformed_tensor_name}, {pos}, out_metas);\n"""
+            save_md5_checksum_str += f"    egr::SaveTensorMD5CheckSumToFile(FLAGS_tensor_md5_checksum_output_path, {transformed_tensor_name});\n"
             outputs_autograd_meta_list.append(output_autograd_meta)
 
         outputs_autograd_meta_str = "\n".join(outputs_autograd_meta_list)
         outputs_autograd_meta_str += SET_TENSOR_NAME_TEMPLATE.format(
             set_tensor_name_str
+        )
+        outputs_autograd_meta_str += SAVE_TENSOR_MD5_CHECKSUM_TEMPLATE.format(
+            save_md5_checksum_str
         )
 
         returns_str = f"{indent}if (NeedComplexToRealConversion()) HandleComplexGradToRealGrad(&returns);\n"
